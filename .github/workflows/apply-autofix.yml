@@ -12,8 +12,7 @@ jobs:
   apply:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout runner branch
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -21,48 +20,7 @@ jobs:
         run: |
           git config user.name "pdurlej"
           git config user.email "1210027+pdurlej@users.noreply.github.com"
-      - name: Assemble segs into chunks (if present)
-        run: |
-          set -euo pipefail
-          python3 <<'PY'
-          from pathlib import Path
-          from collections import defaultdict
-          import hashlib
-          root = Path("_agent/autofix-20261020")
-          segs = root / "segs"
-          chunks = root / "chunks"
-          chunks.mkdir(parents=True, exist_ok=True)
-          if not segs.is_dir():
-              print("no segs/ — skip assemble")
-              raise SystemExit(0)
-          groups = defaultdict(list)
-          for p in sorted(segs.iterdir()):
-              if not p.is_file():
-                  continue
-              # C.02.hex.00 → C.02.hex
-              name = p.name.rsplit(".", 1)[0]
-              groups[name].append(p)
-          changed = False
-          for name, parts in sorted(groups.items()):
-              parts = sorted(parts, key=lambda x: x.name)
-              data = "".join(p.read_text() for p in parts)
-              out = chunks / name
-              prev = out.read_text() if out.exists() else None
-              if prev != data:
-                  out.write_text(data)
-                  changed = True
-              digest = hashlib.sha256(data.encode()).hexdigest()
-              print(f"assembled {name} bytes={len(data)} parts={len(parts)} sha256={digest}")
-          print("changed", changed)
-          PY
-          git add _agent/autofix-20261020/chunks || true
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(agent): assemble segs into C/D chunks"
-            git push origin HEAD:piotr/autofix-runner
-          else
-            echo "chunks already up to date"
-          fi
-      - name: Rebuild C/D patches and force-update tips
+      - name: Rebuild A/B and force-update tips
         run: |
           set -euo pipefail
           ROOT="_agent/autofix-20261020"
@@ -70,39 +28,29 @@ jobs:
           from pathlib import Path
           root = Path("_agent/autofix-20261020")
           chunks = root / "chunks"
-          for name in ["C", "D"]:
+          for name in ["A", "B"]:
               parts = sorted(chunks.glob(f"{name}.*.hex"))
               if not parts:
                   raise SystemExit(f"missing chunks for {name}")
               data = bytes.fromhex("".join(p.read_text().strip() for p in parts))
-              out = root / f"{name}.patch"
-              out.write_bytes(data)
+              (root / f"{name}.patch").write_bytes(data)
               print(name, "bytes", len(data), "parts", len(parts))
-          go = root / "GO2"
-          if not go.exists():
-              print("GO2 absent — rebuilt only")
+          if not (root / "GO3").exists():
+              print("GO3 absent")
               raise SystemExit(0)
-          print("GO2 present — force-updating C/D")
+          print("GO3 present")
           PY
-          if [ ! -f "$ROOT/GO2" ]; then
-            echo "waiting for GO2"
-            exit 0
-          fi
+          if [ ! -f "$ROOT/GO3" ]; then exit 0; fi
           git remote add upstream https://github.com/mvschwarz/openrig.git || true
           git fetch upstream main
           echo "upstream/main=$(git rev-parse upstream/main)"
-
           apply_one() {
-            local branch="$1"
-            local patch="$2"
-            echo "=== Force-updating $branch from $patch ==="
+            local branch="$1" patch="$2"
             git checkout -B "$branch" upstream/main
             git am --3way "$ROOT/$patch"
             git push -f origin "HEAD:refs/heads/$branch"
             echo "Pushed $(git rev-parse HEAD) -> $branch"
           }
-
-          apply_one "piotr/upstream-writer-authority-v2" "C.patch"
-          apply_one "piotr/upstream-accept-receipt-binding-v2" "D.patch"
-
+          apply_one "piotr/upstream-pr1-readonly-mcp-events" "A.patch"
+          apply_one "piotr/upstream-harness-registry-interim" "B.patch"
           git checkout piotr/autofix-runner || git checkout -B piotr/autofix-runner
