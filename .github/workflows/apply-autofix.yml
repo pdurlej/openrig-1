@@ -21,7 +21,7 @@ jobs:
         run: |
           git config user.name "pdurlej"
           git config user.email "1210027+pdurlej@users.noreply.github.com"
-      - name: Rebuild patches and force-update PR tips
+      - name: Rebuild C/D patches and force-update tips
         run: |
           set -euo pipefail
           ROOT="_agent/autofix-20261020"
@@ -29,7 +29,7 @@ jobs:
           from pathlib import Path
           root = Path("_agent/autofix-20261020")
           chunks = root / "chunks"
-          for name in ["A", "B", "C", "D"]:
+          for name in ["C", "D"]:
               parts = sorted(chunks.glob(f"{name}.*.hex"))
               if not parts:
                   raise SystemExit(f"missing chunks for {name}")
@@ -37,15 +37,14 @@ jobs:
               out = root / f"{name}.patch"
               out.write_bytes(data)
               print(name, "bytes", len(data), "parts", len(parts))
-          # require GO signal so partial uploads do not force-push
-          go = root / "GO"
+          go = root / "GO2"
           if not go.exists():
-              print("GO signal absent — rebuilt patches only, no force-push")
+              print("GO2 absent — rebuilt only")
               raise SystemExit(0)
-          print("GO present — force-updating tips")
+          print("GO2 present — force-updating C/D")
           PY
-          if [ ! -f "$ROOT/GO" ]; then
-            echo "waiting for GO"
+          if [ ! -f "$ROOT/GO2" ]; then
+            echo "waiting for GO2"
             exit 0
           fi
           git remote add upstream https://github.com/mvschwarz/openrig.git || true
@@ -62,8 +61,6 @@ jobs:
             echo "Pushed $(git rev-parse HEAD) -> $branch"
           }
 
-          apply_one "piotr/upstream-pr1-readonly-mcp-events" "A.patch"
-          apply_one "piotr/upstream-harness-registry-interim" "B.patch"
           apply_one "piotr/upstream-writer-authority-v2" "C.patch"
           apply_one "piotr/upstream-accept-receipt-binding-v2" "D.patch"
 
