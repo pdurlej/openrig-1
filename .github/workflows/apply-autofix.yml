@@ -20,7 +20,7 @@ jobs:
         run: |
           git config user.name "pdurlej"
           git config user.email "1210027+pdurlej@users.noreply.github.com"
-      - name: Rebuild A/B and force-update tips
+      - name: Assemble A.00/B.00 segs into chunks, rebuild A/B, force-update tips
         run: |
           set -euo pipefail
           ROOT="_agent/autofix-20261020"
@@ -28,19 +28,35 @@ jobs:
           from pathlib import Path
           root = Path("_agent/autofix-20261020")
           chunks = root / "chunks"
+          segs = root / "segs"
+          for stem in ["A.00.hex", "B.00.hex"]:
+              parts = sorted(segs.glob(f"{stem}.*"))
+              if not parts:
+                  print(f"no segs for {stem}; keeping existing chunk")
+                  continue
+              data = "".join(p.read_text() for p in parts)
+              (chunks / stem).write_text(data)
+              print(f"assembled {stem} from {len(parts)} segs -> {len(data)} chars")
+          expected = {"A": 28629, "B": 26532}
           for name in ["A", "B"]:
               parts = sorted(chunks.glob(f"{name}.*.hex"))
               if not parts:
                   raise SystemExit(f"missing chunks for {name}")
               data = bytes.fromhex("".join(p.read_text().strip() for p in parts))
               (root / f"{name}.patch").write_bytes(data)
-              print(name, "bytes", len(data), "parts", len(parts))
-          if not (root / "GO3").exists():
-              print("GO3 absent")
-              raise SystemExit(0)
-          print("GO3 present")
+              print(name, "bytes", len(data), "parts", len(parts), "expected", expected[name])
+              if len(data) != expected[name]:
+                  raise SystemExit(f"{name} size mismatch: {len(data)} != {expected[name]}")
+          go3 = (root / "GO3").exists()
+          print("GO3 present" if go3 else "GO3 absent")
+          open("/tmp/go3_flag", "w").write("1" if go3 else "0")
           PY
-          if [ ! -f "$ROOT/GO3" ]; then exit 0; fi
+          if ! git diff --quiet -- "$ROOT/chunks/A.00.hex" "$ROOT/chunks/B.00.hex" 2>/dev/null; then
+            git add "$ROOT/chunks/A.00.hex" "$ROOT/chunks/B.00.hex"
+            git commit -m "chore(agent): assemble A.00+B.00 chunks from segs"
+            git push origin HEAD:piotr/autofix-runner
+          fi
+          if [ "$(cat /tmp/go3_flag)" != "1" ]; then exit 0; fi
           git remote add upstream https://github.com/mvschwarz/openrig.git || true
           git fetch upstream main
           echo "upstream/main=$(git rev-parse upstream/main)"
