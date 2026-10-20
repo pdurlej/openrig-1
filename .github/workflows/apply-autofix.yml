@@ -21,6 +21,47 @@ jobs:
         run: |
           git config user.name "pdurlej"
           git config user.email "1210027+pdurlej@users.noreply.github.com"
+      - name: Assemble segs into chunks (if present)
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          from collections import defaultdict
+          import hashlib
+          root = Path("_agent/autofix-20261020")
+          segs = root / "segs"
+          chunks = root / "chunks"
+          chunks.mkdir(parents=True, exist_ok=True)
+          if not segs.is_dir():
+              print("no segs/ — skip assemble")
+              raise SystemExit(0)
+          groups = defaultdict(list)
+          for p in sorted(segs.iterdir()):
+              if not p.is_file():
+                  continue
+              # C.02.hex.00 → C.02.hex
+              name = p.name.rsplit(".", 1)[0]
+              groups[name].append(p)
+          changed = False
+          for name, parts in sorted(groups.items()):
+              parts = sorted(parts, key=lambda x: x.name)
+              data = "".join(p.read_text() for p in parts)
+              out = chunks / name
+              prev = out.read_text() if out.exists() else None
+              if prev != data:
+                  out.write_text(data)
+                  changed = True
+              digest = hashlib.sha256(data.encode()).hexdigest()
+              print(f"assembled {name} bytes={len(data)} parts={len(parts)} sha256={digest}")
+          print("changed", changed)
+          PY
+          git add _agent/autofix-20261020/chunks || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(agent): assemble segs into C/D chunks"
+            git push origin HEAD:piotr/autofix-runner
+          else
+            echo "chunks already up to date"
+          fi
       - name: Rebuild C/D patches and force-update tips
         run: |
           set -euo pipefail
