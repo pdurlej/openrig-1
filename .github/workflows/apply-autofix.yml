@@ -1,0 +1,48 @@
+name: apply-autofix-abcd
+on:
+  push:
+    branches: [piotr/autofix-runner]
+    paths:
+      - "_agent/autofix-20261020/**"
+      - ".github/workflows/apply-autofix.yml"
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout runner branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Configure git
+        run: |
+          git config user.name "pdurlej"
+          git config user.email "1210027+pdurlej@users.noreply.github.com"
+      - name: Fetch upstream main and apply patches
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/mvschwarz/openrig.git || true
+          git fetch upstream main
+          UPSTREAM=$(git rev-parse upstream/main)
+          echo "upstream/main=$UPSTREAM"
+
+          apply_one() {
+            local branch="$1"
+            local patch="$2"
+            echo "=== Force-updating $branch from $patch ==="
+            git checkout -B "$branch" upstream/main
+            git am --3way "_agent/autofix-20261020/$patch"
+            git push -f origin "HEAD:refs/heads/$branch"
+            echo "Pushed $(git rev-parse HEAD) -> $branch"
+          }
+
+          apply_one "piotr/upstream-pr1-readonly-mcp-events" "A.patch"
+          apply_one "piotr/upstream-harness-registry-interim" "B.patch"
+          apply_one "piotr/upstream-writer-authority-v2" "C.patch"
+          apply_one "piotr/upstream-accept-receipt-binding-v2" "D.patch"
+
+          # Keep runner branch pointing at itself (do not leave detached on a PR branch)
+          git checkout piotr/autofix-runner || git checkout -B piotr/autofix-runner
