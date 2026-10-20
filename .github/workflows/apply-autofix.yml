@@ -21,20 +21,43 @@ jobs:
         run: |
           git config user.name "pdurlej"
           git config user.email "1210027+pdurlej@users.noreply.github.com"
-      - name: Fetch upstream main and apply patches
+      - name: Rebuild patches and force-update PR tips
         run: |
           set -euo pipefail
+          ROOT="_agent/autofix-20261020"
+          python3 <<'PY'
+          from pathlib import Path
+          root = Path("_agent/autofix-20261020")
+          chunks = root / "chunks"
+          for name in ["A", "B", "C", "D"]:
+              parts = sorted(chunks.glob(f"{name}.*.hex"))
+              if not parts:
+                  raise SystemExit(f"missing chunks for {name}")
+              data = bytes.fromhex("".join(p.read_text().strip() for p in parts))
+              out = root / f"{name}.patch"
+              out.write_bytes(data)
+              print(name, "bytes", len(data), "parts", len(parts))
+          # require GO signal so partial uploads do not force-push
+          go = root / "GO"
+          if not go.exists():
+              print("GO signal absent — rebuilt patches only, no force-push")
+              raise SystemExit(0)
+          print("GO present — force-updating tips")
+          PY
+          if [ ! -f "$ROOT/GO" ]; then
+            echo "waiting for GO"
+            exit 0
+          fi
           git remote add upstream https://github.com/mvschwarz/openrig.git || true
           git fetch upstream main
-          UPSTREAM=$(git rev-parse upstream/main)
-          echo "upstream/main=$UPSTREAM"
+          echo "upstream/main=$(git rev-parse upstream/main)"
 
           apply_one() {
             local branch="$1"
             local patch="$2"
             echo "=== Force-updating $branch from $patch ==="
             git checkout -B "$branch" upstream/main
-            git am --3way "_agent/autofix-20261020/$patch"
+            git am --3way "$ROOT/$patch"
             git push -f origin "HEAD:refs/heads/$branch"
             echo "Pushed $(git rev-parse HEAD) -> $branch"
           }
@@ -44,5 +67,4 @@ jobs:
           apply_one "piotr/upstream-writer-authority-v2" "C.patch"
           apply_one "piotr/upstream-accept-receipt-binding-v2" "D.patch"
 
-          # Keep runner branch pointing at itself (do not leave detached on a PR branch)
           git checkout piotr/autofix-runner || git checkout -B piotr/autofix-runner
