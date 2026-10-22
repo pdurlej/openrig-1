@@ -1,0 +1,134 @@
++    expect(seqs(first.data)).toEqual([a1]);
++    const second = await replay({ rigId: "team", since: first.data.nextCursor });
++    expect(seqs(second.data)).toEqual([a2]);
++    expect(await replay({ rigId: "team", since: a2 })).toEqual({ isError: false, data: { events: [], nextCursor: a2, exhausted: true } });
++  });
++
++  it("is a cursor_expired error with the resyncCursor to continue from when the cursor is older than the stored log", async () => {
++    const a1 = emit(rigId, 1);
++    const a2 = emit(rigId, 2);
++    // The log is never pruned today: deleting its oldest row stands in for a retention that has.
++    db.prepare("DELETE FROM events WHERE seq <= ?").run(a1);
++
++    const expired = await replay({ rigId, since: 0 });
++    expect(expired.isError).toBe(true);
++    expect(expired.data).toMatchObject({ error: "cursor_expired", oldestSeq: a2, resyncCursor: a1 });
++    expect(seqs((await replay({ rigId, since: expired.data.resyncCursor })).data)).toEqual([a2]);
++  });
++});
+diff --git a/packages/cli/test/mcp-server.test.ts b/packages/cli/test/mcp-server.test.ts
+index 058c29db..d89c0270 100644
+--- a/packages/cli/test/mcp-server.test.ts
++++ b/packages/cli/test/mcp-server.test.ts
+@@ -43,4 +43,4 @@ describe("MCP Server", () => {
+
+-  // T1: MCP server lists all 23 tools: the original 18 and the five queue tools
+-  it("lists all 23 tools", async () => {
++  // T1: MCP server lists all 24 tools: the original 18, the five queue tools and the event log replay
++  it("lists all 24 tools", async () => {
+     await setup();
+@@ -58,2 +58,3 @@ describe("MCP Server", () => {
+       "rig_down",
++      "rig_events_replay",
+       "rig_ps",
+@@ -301,3 +302,3 @@ describe("MCP Server", () => {
+     const result = await mcpClient.listTools();
+-    expect(result.tools.length).toBe(23);
++    expect(result.tools.length).toBe(24);
+
+@@ -315,3 +316,3 @@ describe("MCP Server", () => {
+     const result2 = await client2.listTools();
+-    expect(result2.tools.length).toBe(23);
++    expect(result2.tools.length).toBe(24);
+
+@@ -696,2 +697,16 @@ describe("MCP Server", () => {
+   });
++
++  it("rig_events_replay polls /api/events/replay from a cursor, a rig name resolved to its id", async () => {
++    const getFn = vi.fn(async (path: string) => path.startsWith("/api/rigs/summary")
++      ? { status: 200, data: [{ id: "rig-1", name: "r01", archivedAt: null }] }
++      : { status: 200, data: { events: [], nextCursor: 10, exhausted: true } });
++    await setup({ get: getFn });
++    const result = await mcpClient.callTool({
++      name: "rig_events_replay",
++      arguments: { since: 10, rigId: "r01", limit: 50 },
++    });
++    expect(getFn).toHaveBeenLastCalledWith("/api/events/replay?since=10&rigId=rig-1&limit=50");
++    expect(result.isError).toBeFalsy();
++    await cleanup();
++  });
+ });
+diff --git a/packages/daemon/assets/plugins/openrig-core/skills/openrig-user/SKILL.md b/packages/daemon/assets/plugins/openrig-core/skills/openrig-user/SKILL.md
+index 4d4bab98..eb64ee5d 100644
+--- a/packages/daemon/assets/plugins/openrig-core/skills/openrig-user/SKILL.md
++++ b/packages/daemon/assets/plugins/openrig-core/skills/openrig-user/SKILL.md
+@@ -1484,2 +1484,3 @@ Current shipped MCP tools:
+ - `rig_queue_create`, `rig_queue_show`, `rig_queue_list`, `rig_queue_claim`, `rig_queue_update`
++- `rig_events_replay`
+
+diff --git a/packages/daemon/src/domain/event-bus.ts b/packages/daemon/src/domain/event-bus.ts
+index 66d1b9e9..8853e152 100644
+--- a/packages/daemon/src/domain/event-bus.ts
++++ b/packages/daemon/src/domain/event-bus.ts
+@@ -284,2 +284,10 @@ export class EventBus {
+
++  /** The oldest stored event's seq, 0 for an empty log. */
++  minSeq(): number {
++    const row = this.db.prepare("SELECT MIN(seq) AS seq FROM events").get() as {
++      seq: number | null;
++    };
++    return row.seq ?? 0;
++  }
++
+   private rowsAfter(seq: number): EventRow[] {
+diff --git a/packages/daemon/src/routes/events.ts b/packages/daemon/src/routes/events.ts
+index c42f397a..1171b71e 100644
+--- a/packages/daemon/src/routes/events.ts
++++ b/packages/daemon/src/routes/events.ts
+@@ -14,2 +14,17 @@ function getEventBus(c: { get: (key: string) => unknown }): EventBus {
+
++/** The 410 body for a cursor whose next event is no longer stored, null for a cursor that can resume: the events in
++ *  between are gone, so the client resyncs from `resyncCursor` instead of resuming with a silent gap. */
++function expiredCursor(eventBus: EventBus, since: number) {
++  const oldestSeq = eventBus.minSeq();
++  if (oldestSeq === 0 || since + 1 >= oldestSeq) return null;
++  return {
++    error: "cursor_expired",
++    message: `event cursor ${since} is behind the oldest stored event (${oldestSeq}): resync from ${oldestSeq - 1}`,
++    since,
++    oldestSeq,
++    newestSeq: eventBus.maxSeq(),
++    resyncCursor: oldestSeq - 1,
++  };
++}
++
+ eventsRoute.get("/", (c) => {
+@@ -21,4 +36,5 @@ eventsRoute.get("/", (c) => {
+
+-  // EventSource sends Last-Event-ID when it reconnects: the events after it are replayed, whatever `replay` says.
+-  const lastEventIdRaw = c.req.header("Last-Event-ID");
++  // EventSource sends Last-Event-ID when it reconnects (`?since=` for a client that can't set it): the events after it
++  // are replayed, whatever `replay` says.
++  const lastEventIdRaw = c.req.header("Last-Event-ID") ?? c.req.query("since");
+   const lastEventId = lastEventIdRaw === undefined ? null : parseInt(lastEventIdRaw, 10);
+@@ -26,2 +42,4 @@ eventsRoute.get("/", (c) => {
+   const eventBus = getEventBus(c);
++  const expired = lastEventId === null || isNaN(lastEventId) ? null : expiredCursor(eventBus, lastEventId);
++  if (expired) return c.json(expired, 410);
+
+@@ -95 +113,20 @@ eventsRoute.get("/", (c) => {
+ });
++
++/** One JSON page of the log the stream replays, for a client that polls instead of holding a stream: up to `limit`
++ *  events after `since` (of one rig when `rigId` is given), oldest first, and the `nextCursor` to pass as the next
++ *  `since`. Without `since` the page starts at the oldest stored event. */
++eventsRoute.get("/replay", (c) => {
++  const rigId = c.req.query("rigId");
++  const sinceParam = c.req.query("since");
++  const since = sinceParam === undefined ? 0 : Number(sinceParam);
++  if (!Number.isSafeInteger(since) || since < 0) return c.json({ error: "since must be a non-negative integer" }, 400);
++  const limitParam = Number(c.req.query("limit"));
++  const limit = Number.isSafeInteger(limitParam) && limitParam > 0 ? Math.min(limitParam, 1000) : 200;
++
++  const eventBus = getEventBus(c);
++  const expired = sinceParam === undefined ? null : expiredCursor(eventBus, since);
