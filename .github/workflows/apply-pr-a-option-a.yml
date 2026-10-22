@@ -3,6 +3,7 @@ name: apply-pr-a-option-a
 # Rebuilds the PR A (Option A) tip from a git bundle on a pinned upstream base, checks it is
 # byte-identical to the local commit (commit, tree and parent SHAs), runs the upstream Tests
 # workflow steps on it, and force-pushes the PR branch only when every check is green.
+# The macOS daemon suite passed on this exact TIP in run 39790913313; the cli leg never got a runner.
 
 on:
   push:
@@ -81,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package: [daemon, cli]
+        package: [cli]
     steps:
       - uses: actions/checkout@v4
         with:
