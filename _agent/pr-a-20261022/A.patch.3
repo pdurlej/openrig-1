@@ -1,0 +1,80 @@
++  if (expired) return c.json(expired, 410);
++
++  const events = eventBus.replayPage(since, eventBus.maxSeq(), limit, rigId);
++  return c.json({ events, nextCursor: events.at(-1)?.seq ?? since, exhausted: events.length < limit });
++});
+diff --git a/packages/daemon/test/events-route.test.ts b/packages/daemon/test/events-route.test.ts
+index be66edaa..c4447513 100644
+--- a/packages/daemon/test/events-route.test.ts
++++ b/packages/daemon/test/events-route.test.ts
+@@ -337,2 +337,69 @@ describe("SSE events route", () => {
+     });
++
++    it("since resumes as Last-Event-ID does, for a client that can't set the header", async () => {
++      const rig = rigRepo.createRig("r01");
++      const seqs = emitMany(rig.id, 3);
++      const res = await app.request(`/api/events?rigId=${rig.id}&replay=0&since=${seqs[0]}`);
++      expect(ids(await readSSEEvents(res, 3))).toEqual(seqs.slice(1));
++    });
++  });
++
++  describe("JSON replay and expired cursors", () => {
++    // The log is never pruned today: deleting its oldest rows stands in for a retention that has.
++    const dropThrough = (seq: number) => db.prepare("DELETE FROM events WHERE seq <= ?").run(seq);
++    const emitThree = (rigId: string) =>
++      [1, 2, 3].map((i) => eventBus.emit({ type: "node.added", rigId, nodeId: `n${i}`, logicalId: `w${i}` }).seq);
++    const replay = async (query: string) => {
++      const res = await app.request(`/api/events/replay${query}`);
++      return { status: res.status, body: (await res.json()) as Record<string, unknown> & { events?: { seq: number }[] } };
++    };
++
++    it("pages one rig's events by limit, nextCursor resuming where a page ended", async () => {
++      const rig = rigRepo.createRig("r01");
++      const other = rigRepo.createRig("r02");
++      eventBus.emit({ type: "rig.created", rigId: other.id });
++      const [a1, a2, a3] = emitThree(rig.id);
++      eventBus.emit({ type: "rig.created", rigId: other.id });
++
++      const first = await replay(`?rigId=${rig.id}&limit=2`);
++      expect(first.body.events!.map((e) => e.seq)).toEqual([a1, a2]);
++      expect(first.body).toMatchObject({ nextCursor: a2, exhausted: false });
++      const second = await replay(`?rigId=${rig.id}&limit=2&since=${a2}`);
++      expect(second.body.events!.map((e) => e.seq)).toEqual([a3]);
++      expect(second.body).toMatchObject({ nextCursor: a3, exhausted: true });
++      expect((await replay(`?rigId=${rig.id}&since=${a3}`)).body).toEqual({ events: [], nextCursor: a3, exhausted: true });
++    });
++
++    it("answers a since whose next event is gone with 410 and a resyncCursor that resumes; no since starts at the oldest stored", async () => {
++      const rig = rigRepo.createRig("r01");
++      const [first, second, third] = emitThree(rig.id);
++      dropThrough(first!);
++
++      const expired = await replay(`?rigId=${rig.id}&since=0`);
++      expect(expired.status).toBe(410);
++      expect(expired.body).toMatchObject({ error: "cursor_expired", since: 0, oldestSeq: second, newestSeq: third, resyncCursor: first });
++      const resumed = await replay(`?rigId=${rig.id}&since=${expired.body.resyncCursor}`);
++      expect(resumed.body.events!.map((e) => e.seq)).toEqual([second, third]);
++      expect((await replay(`?rigId=${rig.id}`)).body.events!.map((e) => e.seq)).toEqual([second, third]);
++    });
++
++    it("rejects a since that is not a non-negative integer", async () => {
++      for (const since of ["abc", "-1", "1.5"]) expect((await replay(`?since=${since}`)).status, since).toBe(400);
++    });
++
++    it("answers an SSE Last-Event-ID or since whose next event is gone with the same 410, before streaming", async () => {
++      const rig = rigRepo.createRig("r01");
++      const [first] = emitThree(rig.id);
++      dropThrough(first!);
++      for (const res of [
++        await app.request(`/api/events?rigId=${rig.id}`, { headers: { "Last-Event-ID": "0" } }),
++        await app.request(`/api/events?rigId=${rig.id}&since=0`),
++      ]) {
++        expect(res.status).toBe(410);
++        expect(await res.json()).toMatchObject({ error: "cursor_expired", resyncCursor: first });
++      }
++      const resumed = await app.request(`/api/events?rigId=${rig.id}`, { headers: { "Last-Event-ID": String(first) } });
++      expect(resumed.status).toBe(200);
++      resumed.body?.cancel();
++    });
+   });
+
