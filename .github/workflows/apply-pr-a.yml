@@ -1,0 +1,43 @@
+name: apply-pr-a
+on:
+  push:
+    branches: [piotr/autofix-runner]
+    paths: ["_agent/pr-a-20261022/GO"]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Rebuild PR A as one commit on the pinned upstream main, verify its tree, force-push
+        env:
+          BASE: b6609ae46c937cb386cb97606b8d1519ae776e7d
+          TREE: b9d05a3904421c1efaa549a9f7fabea0a5405160
+          TARGET: piotr/upstream-pr1-readonly-mcp-events
+        run: |
+          set -euo pipefail
+          git config user.name "pdurlej"
+          git config user.email "1210027+pdurlej@users.noreply.github.com"
+          D=_agent/pr-a-20261022
+          cat "$D/A.patch.1" "$D/A.patch.2" "$D/A.patch.3" > /tmp/A.patch
+          sha256sum /tmp/A.patch
+          git fetch https://github.com/mvschwarz/openrig.git main
+          git checkout --detach "$BASE"
+          git am --whitespace=nowarn /tmp/A.patch
+          node scripts/regen-edge-digests.mjs
+          git add scripts/skill-edge-digests.generated.json
+          git commit --amend --no-edit
+          git log -1 --stat
+          if [ "$(git rev-parse 'HEAD^{tree}')" != "$TREE" ]; then
+            git push -f origin "HEAD:refs/heads/piotr/pr-a-debug"
+            echo "tree mismatch: pushed piotr/pr-a-debug for inspection"
+            exit 1
+          fi
+          git push -f origin "HEAD:refs/heads/$TARGET"
+          echo "pushed $(git rev-parse HEAD) to $TARGET"
