@@ -1,0 +1,132 @@
+From cb425f3ca1a4f53fd840ab7807c33fd3424ade02 Mon Sep 17 00:00:00 2001
+From: pdurlej <1210027+pdurlej@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 13:26:23 +0000
+Subject: [PATCH] feat(mcp,events): poll the event log by cursor over JSON and
+ MCP
+
+An MCP client, or anything that can't hold an SSE stream, can read the daemon's event log a page at a time from a
+cursor: `GET /api/events/replay` and the `rig_events_replay` MCP tool. It is the log the SSE stream replays, read with
+the stream's `replayPage`, not a second one.
+
+- `GET /api/events/replay?since=&rigId=&limit=` returns up to `limit` events (default 200, at most 1000) after `since`,
+  oldest first, with the `nextCursor` to pass as the next `since` and whether the page reached the newest event.
+- A cursor whose next event is no longer stored answers 410 `cursor_expired` with the `resyncCursor` to continue from,
+  on the JSON page and on the SSE stream (`Last-Event-ID`, or `?since=` for a client that can't set the header),
+  instead of resuming across a silent gap. The log is never pruned today, so no client meets it yet.
+- `rig_events_replay` takes a rig name or id, as the other rig tools do.
+- The openrig-user skill and the as-built stack list the tool (24 MCP tools).
+---
+ docs/as-built/architecture/daemon-core.md     |  2 +-
+ packages/cli/src/mcp-server.ts                | 26 +++++++
+ packages/cli/test/mcp-events-daemon.test.ts   | 73 +++++++++++++++++++
+ packages/cli/test/mcp-server.test.ts          | 23 +++++-
+ .../openrig-core/skills/openrig-user/SKILL.md |  1 +
+ packages/daemon/src/domain/event-bus.ts       |  8 ++
+ packages/daemon/src/routes/events.ts          | 41 ++++++++++-
+ packages/daemon/test/events-route.test.ts     | 67 +++++++++++++++++
+ 8 files changed, 234 insertions(+), 7 deletions(-)
+ create mode 100644 packages/cli/test/mcp-events-daemon.test.ts
+
+diff --git a/docs/as-built/architecture/daemon-core.md b/docs/as-built/architecture/daemon-core.md
+index f2c2da41..e7110434 100644
+--- a/docs/as-built/architecture/daemon-core.md
++++ b/docs/as-built/architecture/daemon-core.md
+@@ -58,3 +58,3 @@ six runtime keys — `claude-code`, `codex`, `pi`, `omp`, `stub`, `terminal`
+ ```text
+-CLI (87 top-level commands) / TUI / web UI / MCP (23 tools)
++CLI (87 top-level commands) / TUI / web UI / MCP (24 tools)
+       |
+diff --git a/packages/cli/src/mcp-server.ts b/packages/cli/src/mcp-server.ts
+index 58262be6..1fdbe983 100644
+--- a/packages/cli/src/mcp-server.ts
++++ b/packages/cli/src/mcp-server.ts
+@@ -628,2 +628,28 @@ export function createMcpServer(client: DaemonClient): McpServer {
+
++  // 24. rig_events_replay — a page of the daemon's event log after a cursor (the log the SSE stream replays)
++  server.tool(
++    "rig_events_replay",
++    "Read the daemon's event log a page at a time: the events after since, and the nextCursor to pass as since on the next call. A poll, not a live subscription. A since older than the stored log is a cursor_expired error with the resyncCursor to continue from.",
++    {
++      since: z.number().int().nonnegative().optional().describe("Return the events after this seq (default: from the oldest stored)"),
++      rigId: z.string().optional().describe("Only this rig's events (rig name or identifier)"),
++      limit: z.number().int().positive().optional().describe("Page size (default 200, at most 1000)"),
++    },
++    async ({ since, rigId, limit }) => {
++      try {
++        const params = new URLSearchParams();
++        if (since !== undefined) params.set("since", String(since));
++        if (rigId) {
++          const rig = await rigIdFor(client, rigId);
++          if ("content" in rig) return rig;
++          params.set("rigId", rig.id);
++        }
++        if (limit !== undefined) params.set("limit", String(limit));
++        return mapResult(await client.get(`/api/events/replay?${params.toString()}`));
++      } catch (err) {
++        return { content: [{ type: "text" as const, text: (err as Error).message }], isError: true as const };
++      }
++    },
++  );
++
+   return server;
+diff --git a/packages/cli/test/mcp-events-daemon.test.ts b/packages/cli/test/mcp-events-daemon.test.ts
+new file mode 100644
+index 00000000..bada10d0
+--- /dev/null
++++ b/packages/cli/test/mcp-events-daemon.test.ts
+@@ -0,0 +1,73 @@
++// rig_events_replay against the daemon's real events route, through the real DaemonClient: an MCP client that holds no
++// stream reads the event log a page at a time, names the rig as the CLI does, and is told to resync when its cursor is
++// older than the stored log.
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { Client } from "@modelcontextprotocol/sdk/client/index.js";
++import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
++import type Database from "better-sqlite3";
++import { createFullTestDb, createTestApp } from "../../daemon/test/helpers/test-app.js";
++import type { EventBus } from "../../daemon/src/domain/event-bus.js";
++import { DaemonClient } from "../src/client.js";
++import { createMcpServer } from "../src/mcp-server.js";
++
++describe("rig_events_replay on the daemon's events route", () => {
++  let db: Database.Database;
++  let eventBus: EventBus;
++  let rigId: string;
++  let otherRigId: string;
++  let replay: (args: Record<string, unknown>) => Promise<{ isError: boolean; data: Record<string, unknown> }>;
++  let close: () => Promise<void>;
++
++  beforeEach(async () => {
++    db = createFullTestDb();
++    const { app, rigRepo, eventBus: bus } = createTestApp(db);
++    eventBus = bus;
++    rigId = rigRepo.createRig("team").id;
++    otherRigId = rigRepo.createRig("other").id;
++
++    const fetchImpl: typeof fetch = (input, init) => app.request(input instanceof Request ? input.url : String(input), init);
++    const mcp = createMcpServer(new DaemonClient("http://127.0.0.1:9", { fetchImpl }));
++    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
++    const client = new Client({ name: "poller", version: "1.0.0" });
++    await mcp.connect(serverTransport);
++    await client.connect(clientTransport);
++    close = async () => { await client.close(); await mcp.close(); };
++    replay = async (args) => {
++      const result = await client.callTool({ name: "rig_events_replay", arguments: args });
++      return { isError: result.isError === true, data: JSON.parse((result.content as Array<{ text: string }>)[0]!.text) };
++    };
++  });
++
++  afterEach(async () => {
++    await close();
++    db.close();
++  });
++
++  const emit = (rig: string, n: number) => eventBus.emit({ type: "node.added", rigId: rig, nodeId: `n${n}`, logicalId: `w${n}` }).seq;
++  const seqs = (data: Record<string, unknown>) => (data.events as Array<{ seq: number }>).map((e) => e.seq);
++
++  it("pages the named rig's events, nextCursor resuming where a page ended", async () => {
++    const a1 = emit(rigId, 1);
++    emit(otherRigId, 2);
++    const a2 = emit(rigId, 3);
++
++    const first = await replay({ rigId: "team", limit: 1 });
++    expect(first.isError).toBe(false);
