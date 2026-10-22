@@ -1,0 +1,170 @@
+name: apply-pr-a-option-a
+
+# Rebuilds the PR A (Option A) tip from a git bundle on a pinned upstream base, checks it is
+# byte-identical to the local commit (commit, tree and parent SHAs), runs the upstream Tests
+# workflow steps on it, and force-pushes the PR branch only when every check is green.
+
+on:
+  push:
+    branches: [piotr/autofix-runner]
+    paths:
+      - "_agent/pr-a-option-a-20261022/**"
+      - ".github/workflows/apply-pr-a-option-a.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apply-pr-a-option-a
+  cancel-in-progress: true
+
+env:
+  ROOT: _agent/pr-a-option-a-20261022
+  BASE: f81d38f2e78e149dc7bc5e4d45bd2456d369b62c
+  TIP: 2d6d6611e566b4cead9db4470f395c8129f95228
+  TREE: 293dbbf79d4a80a44934b4f85d6762687c3d4f3d
+  BUNDLE_SHA256: 3d86a355c2f69e77435e8da047a5a50d63408331e94a727d32c4052963df2f9d
+  BUNDLE_HEAD: refs/heads/cursor/pr-a-option-a-e395
+  TARGET: piotr/upstream-pr1-readonly-mcp-events
+  LEASE: 7ce98da0ad6b900ede6992127cb05763bab710c5
+
+jobs:
+  ubuntu-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: runner
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: mvschwarz/openrig
+          ref: ${{ env.BASE }}
+          fetch-depth: 0
+          path: tip
+          persist-credentials: false
+      - name: Rebuild and verify the tip
+        working-directory: tip
+        run: |
+          set -euo pipefail
+          python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(open(sys.argv[1]).read()))' "../runner/$ROOT/tip.bundle.b64" > "$RUNNER_TEMP/tip.bundle"
+          echo "$BUNDLE_SHA256  $RUNNER_TEMP/tip.bundle" | sha256sum -c -
+          git bundle verify "$RUNNER_TEMP/tip.bundle"
+          git fetch -q "$RUNNER_TEMP/tip.bundle" "$BUNDLE_HEAD:refs/heads/option-a"
+          test "$(git rev-parse option-a)" = "$TIP"
+          test "$(git rev-parse 'option-a^{tree}')" = "$TREE"
+          test "$(git rev-parse 'option-a^')" = "$BASE"
+          git checkout -q option-a
+          git show --stat --format='%H %an <%ae>%n%s' HEAD
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tip/package-lock.json
+      - working-directory: tip
+        run: npm ci
+      - working-directory: tip
+        run: npm run build
+      - working-directory: tip
+        run: npm run lint
+      - working-directory: tip
+        run: npm run test:repo
+      - name: Installed package, daemon restart, and seeded durability failure
+        working-directory: tip
+        run: bash scripts/run-pr-scenarios.sh
+
+  macos-package-tests:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [daemon, cli]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: runner
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: mvschwarz/openrig
+          ref: ${{ env.BASE }}
+          fetch-depth: 0
+          path: tip
+          persist-credentials: false
+      - name: Rebuild and verify the tip
+        working-directory: tip
+        run: |
+          set -euo pipefail
+          python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(open(sys.argv[1]).read()))' "../runner/$ROOT/tip.bundle.b64" > "$RUNNER_TEMP/tip.bundle"
+          echo "$BUNDLE_SHA256  $RUNNER_TEMP/tip.bundle" | shasum -a 256 -c -
+          git bundle verify "$RUNNER_TEMP/tip.bundle"
+          git fetch -q "$RUNNER_TEMP/tip.bundle" "$BUNDLE_HEAD:refs/heads/option-a"
+          test "$(git rev-parse option-a)" = "$TIP"
+          test "$(git rev-parse 'option-a^{tree}')" = "$TREE"
+          git checkout -q option-a
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tip/package-lock.json
+      - run: brew install tmux
+      - working-directory: tip
+        run: npm ci
+      - name: Build the packages the tests import
+        working-directory: tip
+        run: npm run build
+      - name: Run the suite without ambient credentials or external network
+        working-directory: tip
+        run: |
+          suite_root=$(mktemp -d "$RUNNER_TEMP/opr-test.XXXXXX")
+          suite_root=$(cd "$suite_root" && pwd -P)
+          mkdir -p "$suite_root/home" "$suite_root/bin"
+          /usr/bin/install -m 0755 /bin/ps "$suite_root/bin/ps"
+          env -i HOME="$suite_root/home" PATH="$PATH" TMPDIR="$suite_root" TMUX_TMPDIR="$suite_root" \
+            CI=true TERM=xterm-256color \
+            sandbox-exec -D IPC_ROOT="$suite_root" -p '(version 1)(allow default)(deny network-outbound)(allow network-outbound (remote ip "localhost:*"))(allow network-outbound (subpath (param "IPC_ROOT")))' \
+            /bin/bash -s "${{ matrix.package }}" <<'SUITE'
+          set -euo pipefail
+          node scripts/ci-macos-process-probe.mjs
+          export PATH="$TMPDIR/bin:$PATH"
+          test "$(command -v ps)" = "$TMPDIR/bin/ps"
+          exec npm run test -w "packages/$1"
+          SUITE
+
+  push:
+    needs: [ubuntu-checks, macos-package-tests]
+    if: github.ref == 'refs/heads/piotr/autofix-runner'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: runner
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: mvschwarz/openrig
+          ref: ${{ env.BASE }}
+          fetch-depth: 0
+          path: tip
+          persist-credentials: false
+      - name: Rebuild, verify and force-push the PR branch
+        working-directory: tip
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(open(sys.argv[1]).read()))' "../runner/$ROOT/tip.bundle.b64" > "$RUNNER_TEMP/tip.bundle"
+          echo "$BUNDLE_SHA256  $RUNNER_TEMP/tip.bundle" | sha256sum -c -
+          git bundle verify "$RUNNER_TEMP/tip.bundle"
+          git fetch -q "$RUNNER_TEMP/tip.bundle" "$BUNDLE_HEAD:refs/heads/option-a"
+          test "$(git rev-parse option-a)" = "$TIP"
+          test "$(git rev-parse 'option-a^{tree}')" = "$TREE"
+          test "$(git rev-parse 'option-a^')" = "$BASE"
+          git push --force-with-lease="refs/heads/$TARGET:$LEASE" \
+            "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$TIP:refs/heads/$TARGET"
+          echo "Pushed $TIP -> $TARGET"
